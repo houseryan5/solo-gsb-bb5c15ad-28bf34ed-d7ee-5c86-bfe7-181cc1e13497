@@ -13,7 +13,7 @@
 """
 from __future__ import annotations
 
-import math
+from fractions import Fraction
 
 from app.models.analysis.fairness import (
     FairnessPrincipalRow,
@@ -59,9 +59,16 @@ def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
     t_end = max(request.timestamp for request in requests)
     width = float(payload.window_seconds)
 
+    # 半开区间的精确判定基于浮点数的真实实数值（Fraction 按二进制位精确表示
+    # 每个 float），既不靠 EPS 容差——容差会把右边界前紧邻的请求提前归入
+    # 下一窗——也不受浮点除法在整数边界附近舍入的影响。
+    origin = Fraction(t_start)
+    window_width = Fraction(width)
+
     def window_index(timestamp: float) -> int:
-        # 半开区间：边界上的请求属于右侧窗口；EPS 吸附浮点毛刺
-        return int(math.floor((timestamp - t_start) / width + EPS))
+        # 窗口 k 为 [t_start + k*width, t_start + (k+1)*width)：
+        # floor 精确求值，恰好落在边界上的请求属于右侧窗口。
+        return int((Fraction(timestamp) - origin) // window_width)
 
     window_count = window_index(t_end) + 1
 

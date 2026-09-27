@@ -209,6 +209,106 @@ def test_per_window_reports_and_half_open_boundary():
     assert w1.most_constrained_principal is None
 
 
+def test_near_boundary_request_stays_in_own_window():
+    # 回归：t=999999999.5 在右边界 1e9 之前，必须留在窗口 0——旧实现用 EPS
+    # 吸附把它提前归入窗口 1，逐窗主体请求数/放行消耗/拒绝次数与窗口数量随之失真。
+    buckets = [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}]
+    requests = [
+        {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "alpha"},
+        {"id": "r2", "timestamp": 999999998.5, "cost": 1, "chain": ["A"], "principal": "beta"},
+        {"id": "r3", "timestamp": 999999999.5, "cost": 1, "chain": ["A"], "principal": "gamma"},
+    ]
+    resp = _run(buckets, requests, window_seconds=1_000_000_000)
+    sim = simulate(
+        SimulateRequest.model_validate(
+            {
+                "buckets": buckets,
+                "requests": [
+                    {k: v for k, v in r.items() if k != "principal"} for r in requests
+                ],
+            }
+        )
+    )
+    assert [r.allowed for r in sim.results] == [True, True, False]
+
+    # 三个请求都在窗口 0 [0, 1e9) 内，不产生第二个窗口
+    assert resp.window_count == 1
+    assert [w.model_dump() for w in resp.windows] == [
+        {"index": 0, "start": 0.0, "end": 1e9}
+    ]
+    w0 = _window(resp, 0)
+    assert w0.principal_count == 3
+    assert w0.request_count == 3 and w0.allowed_count == 2 and w0.rejected_count == 1
+    assert w0.allowed_consumption == 2
+    gamma = _principal(w0, "gamma")
+    assert gamma.request_count == 1 and gamma.allowed_count == 0
+    assert gamma.rejected_count == 1 and gamma.allowed_consumption == 0
+    # gamma 份额 2/3、获得 0 -> 最受限；首个短缺即边界前的 r3（余额 0.75）
+    assert w0.most_constrained_principal == "gamma"
+    assert w0.first_shortfall.request_id == "r3"
+    assert w0.first_shortfall.available == 0.75
+    # 全局汇总与逐窗统计一致（单窗口时完全相等）
+    g = resp.global_report
+    assert g.principal_count == w0.principal_count
+    assert g.request_count == w0.request_count
+    assert g.allowed_count == w0.allowed_count
+    assert g.rejected_count == w0.rejected_count
+    assert g.allowed_consumption == w0.allowed_consumption
+    assert g.weighted_jain_index == w0.weighted_jain_index
+    assert g.most_constrained_principal == "gamma"
+    assert g.first_shortfall.request_id == "r3"
+
+
+def test_boundary_sweep_window_assignment():
+    # 半开归属扫掠：t3 < 1e9 时留在窗口 0，t3 >= 1e9 时进入窗口 1；
+    # 窗口数量、逐窗统计与全局汇总随归属一致变化，判定始终与 /simulate 相同。
+    buckets = [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}]
+    width = 1_000_000_000
+    for offset in (-1, -0.5, 0, 0.5, 1):
+        t3 = width + offset
+        requests = [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "alpha"},
+            {"id": "r2", "timestamp": width - 1.5, "cost": 1, "chain": ["A"], "principal": "beta"},
+            {"id": "r3", "timestamp": t3, "cost": 1, "chain": ["A"], "principal": "beta"},
+        ]
+        resp = _run(buckets, requests, window_seconds=width)
+        sim = simulate(
+            SimulateRequest.model_validate(
+                {
+                    "buckets": buckets,
+                    "requests": [
+                        {k: v for k, v in r.items() if k != "principal"} for r in requests
+                    ],
+                }
+            )
+        )
+        verdicts = [r.allowed for r in sim.results]
+        # 边界前余额只补到 0.75 以下被拒，边界上及之后补满放行
+        assert verdicts == [True, True, offset >= 0]
+
+        r3_window = 0 if t3 < width else 1
+        assert resp.window_count == r3_window + 1
+        w0 = _window(resp, 0)
+        # 窗口 0：r1/r2 放行各计 1；r3 留在窗口 0 时被拒计 1
+        assert w0.request_count == (3 if r3_window == 0 else 2)
+        assert w0.allowed_consumption == 2
+        assert w0.rejected_count == (1 if r3_window == 0 else 0)
+        beta0 = _principal(w0, "beta")
+        assert beta0.request_count == (2 if r3_window == 0 else 1)
+        if r3_window == 1:
+            w1 = _window(resp, 1)
+            assert w1.request_count == 1 and w1.allowed_count == 1
+            assert _principal(w1, "beta").allowed_consumption == 1
+        # 全局汇总 = 逐窗合计，且与 /simulate 判定一致
+        g = resp.global_report
+        assert g.request_count == 3
+        assert g.allowed_count == sum(verdicts)
+        assert g.rejected_count == verdicts.count(False)
+        assert g.allowed_consumption == sum(
+            w.allowed_consumption for w in resp.window_reports
+        )
+
+
 def test_per_window_first_shortfall_is_window_local():
     # beta 在两个窗口各被拒一次；窗口 1 的 first_shortfall 必须指向窗口内拒绝
     resp = _run(
